@@ -1,9 +1,9 @@
+const crypto = require('crypto');
 const { Configuration, OpenAIApi } = require('openai');
 const Koa = require('koa');
 const Router = require('koa-router');
 const logger = require('koa-logger');
 const bodyParser = require('koa-bodyparser');
-const xml2js = require('xml2js');
 const fs = require('fs');
 const path = require('path');
 const { Op } = require('sequelize');
@@ -16,8 +16,21 @@ const {
   AI_TYPE_TEXT,
   AI_TYPE_IMAGE,
 } = require('./db');
+const crypto = require('crypto');
+const xml2js = require('xml2js');
 
-const { sleep, strip } = require('./utils');
+const builder = new xml2js.Builder({
+  rootName: 'xml',
+  cdata: true,
+  headless: true,
+});
+
+const parser = new xml2js.Parser({
+  explicitArray: false,
+  explicitRoot: false,
+  ignoreAttrs: true,
+  tagNameProcessors: [xml2js.processors.stripPrefix],
+});
 
 const router = new Router();
 
@@ -35,10 +48,11 @@ const AI_THINKING_MESSAGE = '我已经在编了，请稍等几秒后复制原文
 const LIMIT_AI_TEXT_COUNT = 10;
 const LIMIT_AI_IMAGE_COUNT = 5;
 
-const LIMIT_COUNT_RESPONSE = '对不起，因为ChatGPT调用收费，您的免费使用额度已用完~'
+const LIMIT_COUNT_RESPONSE =
+  '对不起，因为ChatGPT调用收费，您的免费使用额度已用完~';
 
 const configuration = new Configuration({
-  apiKey: '##your api key##',
+  apiKey: 'YOUR_API_KEY', // 请替换为自己的 OpenAI API Key
 });
 
 const openai = new OpenAIApi(configuration);
@@ -83,269 +97,157 @@ async function getAIIMAGE(prompt) {
 
   const imageURL = response?.data?.data?.[0].url || 'AI 作画挂了';
 
-  return imageURL;
+  return imageURL
 }
 
-// 解析微信公众号的消息
-async function parseXML(xml) {
-  return new Promise((resolve, reject) => {
-    xml2js.parseString(xml, {trim: true}, (err, result) => {
-      if (err) {
-        reject(err);
-      } else {
-        resolve(result);
-      }
-    });
-  });
+async function getAIMessage({ Content, FromUserName }) {
+// 找一下，是否已有记录
+const message = await Message.findOne({
+where: {
+fromUser: FromUserName,
+request: Content,
+},
+});
+
+// 已回答，直接返回消息
+if (message?.status === MESSAGE_STATUS_ANSWERED) {
+return `[GPT]: ${message?.response}`;
 }
 
-// 将微信公众号消息转为json
-async function formatMessage(result) {
-      const message = {};
-      if (typeof result === 'object') {
-      for (const key in result) {
-      if (!(result[key] instanceof Array) || result[key].length === 0) {
-      continue;
-      }
-      if (result[key].length === 1) {
-      const val = result[key][0];
-      if (typeof val === 'object') {
-      message[key] = formatMessage(val);
-      } else {
-      message[key] = (val || '').trim();
-      }
-      } else {
-      message[key] = [];
-      for (let i = 0, l = result[key].length; i < l; i++) {
-      message[key].push(formatMessage(result[key][i]));
-      }
-      }
-      }
-      }
-      return message;
-      }
-      
-      async function getAIMessage({ Content, FromUserName }) {
-      // 找一下，是否已有记录
-      const message = await Message.findOne({
-      where: {
-      fromUser: FromUserName,
-      request: Content,
-      },
-      });
-      
-      // 已回答，直接返回消息
-      if (message?.status === MESSAGE_STATUS_ANSWERED) {
-      return `[GPT]: ${message?.response}`;
-      }
-      
-      // 在回答中
-      if (message?.status === MESSAGE_STATUS_THINKING) {
-      return AI_THINKING_MESSAGE;
-      }
-      
-      const aiType = Content.startsWith(AI_IMAGE_KEY)
-      ? AI_TYPE_IMAGE
-      : AI_TYPE_TEXT;
-      
-      // 检查一下历史消息记录，不能超过限制
-      const count = await Message.count({
-      where: {
-      fromUser: FromUserName,
-      aiType: aiType,
-      },
-      });
-      
-      // 超过限制，返回提示
-      if (aiType === AI_TYPE_TEXT && count >= LIMIT_AI_TEXT_COUNT) {
-      return LIMIT_COUNT_RESPONSE;
-      }
-      
-      // 超过限制，返回提示
-      if (aiType === AI_TYPE_IMAGE && count >= LIMIT_AI_IMAGE_COUNT) {
-      return LIMIT_COUNT_RESPONSE;
-      }
-      
-      // 没超过限制时，正常走AI链路
-      // 因为AI响应比较慢，容易超时，先插入一条记录，维持状态，待后续更新记录。
-      await Message.create({
-      fromUser: FromUserName,
-      response: '',
-      request: Content,
-      aiType,
-      });
-      
-      let response = '';
-      
-      if (aiType === AI_TYPE_TEXT) {
-      // 构建带上下文的 prompt
-      const prompt = await buildCtxPrompt({ FromUserName });
-      
-      // 请求远程消息
-      response = await getAIResponse(prompt);
-      }
-      
-      if (aiType === AI_TYPE_IMAGE) {
-      // 去掉开始前的关键词
-      const prompt = Content.substring(AI_IMAGE_KEY.length);
-      // 请求远程消息
-      response = await getAIIMAGE(prompt);
-      }
-      
-      // 成功后，更新记录
-      await Message.update(
-      {
-      response: response,
-      status: MESSAGE_STATUS_ANSWERED,
-      },
-      {
-      where: {
-      fromUser: FromUserName,
-      request: Content,
-      },
-      },
-      );
-      
-      return `[GPT]: ${response}`;
-      }
-      
-      // 消息推送
-      router.post('/message/post', async ctx => {
-      const xml = ctx.request.body;
-      const result = await parseXML(xml);
-      const message = await formatMessage(result.xml);
-      const { ToUserName, FromUserName, Content} = message;
+// 在回答中
+if (message?.status === MESSAGE_STATUS_THINKING) {
+return AI_THINKING_MESSAGE;
+}
 
-      if (!FromUserName) {
-      ctx.body = {
-      ToUserName: FromUserName,
-      FromUserName: ToUserName,
-      CreateTime: message.CreateTime,
-      MsgType: 'text',
-      Content: '无用户信息',
-      };
-      return;
-      }
-      
-      if ((Content || '').trim() === '获取id') {
-      ctx.body = {
-      ToUserName: FromUserName,
-      FromUserName: ToUserName,
-      CreateTime: message.CreateTime,
-      MsgType: 'text',
-      Content: FromUserName,
-      };
-      return;
-      }
-      
-      if ((Content || '').startsWith(CLEAR_KEY)) {
-      const clearType = Content.startsWith(CLEAR_KEY_IMAGE)
-      ? AI_TYPE_IMAGE
-      : AI_TYPE_TEXT;
-      const FromUserName = Content.substring(CLEAR_KEY_TEXT.length);
-      const count = await Message.destroy({
-      where: {
-      fromUser: FromUserName,
-      aiType: {
-      [Op.or]: [clearType, null],
-      },
-      },
-      });
-      ctx.body = {
-      ToUserName: FromUserName,
-      FromUserName: ToUserName,
-      CreateTime: message.CreateTime,
-      MsgType: 'text',
-      Content: `已重置用户共 ${count} 条消息`,
-      };
-      return;
-      }
-      
-      const messageResponse = await getAIMessage({ Content, FromUserName });
-      const replyMessage = {
-      ToUserName: FromUserName,
-      FromUserName: ToUserName,
-      CreateTime: message.CreateTime,
-      MsgType: 'text',
-      Content: messageResponse,
-      };
-      const replyXML = await tpl(replyMessage);
-      
-      ctx.status = 200;
-      ctx.type = 'application/xml';
-      ctx.body = replyXML;
-      });
-      
-      // 首页
-      router.get('/', async ctx => {
-      ctx.body = homePage;
-      });
-      
-      // 更新计数
-      router.post('/api/count', async ctx => {
-      const { request } = ctx;
-      const { action } = request.body;
-      if (action === 'inc') {
-      await Counter.create();
-      } else if (action === 'clear') {
-      await Counter.destroy({
-      truncate: true,
-      });
-      }
-      
-      ctx.body = {
-      code: 0,
-      data: (await Counter.count()) + 10,
-      };
-      });
-      
-      // 获取计数
-      router.get('/api/count', async ctx => {
-      const result = await Counter.count();
-      
-      ctx.body = {
-      code: 0,
-      data: result,
-      };
-      });
-      
-      // 小程序调用，获取微信 Open ID
-      router.get('/api/wx_openid', async ctx => {
-      if (ctx.request.headers['x-wx-source']) {
-      ctx.body = ctx.request.headers['x-wx-openid'];
-      }
-      });
-      
-      const app = new Koa();
-      app
-      .use(logger())
-      .use(bodyParser())
-      .use(async (ctx, next) => {
-      const { signature, timestamp, nonce, echostr } = ctx.query;
-      const token = 'YOUR_TOKEN'; // 请替换为自己的 Token
-      const sha1 = crypto.createHash('sha1');
-      const arr = [token, timestamp, nonce];
-      arr.sort();
-      sha1.update(arr.join(''));
-      const result = sha1.digest('hex');
-      if (result === signature) {
-      ctx.body = echostr;
-      } else {
-      ctx.body = 'Fail';
-      }
-      })
-      .use(router.routes())
-      .use(router.allowedMethods());
-      
-      const port = process.env.PORT || 80;
-      async function bootstrap() {
-      await initDB();
-      
-      app.listen(port, '127.0.0.1', () => {
-        console.log('启动成功', port);
-        });
-        }
-        
-        bootstrap();
-        
-        module.exports = app;
+const aiType = Content.startsWith(AI_IMAGE_KEY)
+? AI_TYPE_IMAGE
+: AI_TYPE_TEXT;
+
+// 检查一下历史消息记录，不能超过限制
+const count = await Message.count({
+where: {
+fromUser: FromUserName,
+aiType: aiType,
+},
+});
+
+// 超过限制，返回提示
+if (aiType === AI_TYPE_TEXT && count >= LIMIT_AI_TEXT_COUNT) {
+return LIMIT_COUNT_RESPONSE;
+}
+
+// 超过限制，返回提示
+if (aiType === AI_TYPE_IMAGE && count >= LIMIT_AI_IMAGE_COUNT) {
+return LIMIT_COUNT_RESPONSE;
+}
+
+// 没超过限制时，正常走AI链路
+// 因为AI响应比较慢，容易超时，先插入一条记录，维持状态，待后续更新记录。
+await Message.create({
+fromUser: FromUserName,
+response: '',
+request: Content,
+aiType,
+});
+
+let response = '';
+
+if (aiType === AI_TYPE_TEXT) {
+// 构建带上下文的 prompt
+const prompt = await buildCtxPrompt({ FromUserName });
+
+// 请求远程消息
+response = await getAIResponse(prompt);
+}
+
+if (aiType === AI_TYPE_IMAGE) {
+// 去掉开始前的关键词
+const prompt = Content.substring(AI_IMAGE_KEY.length);
+// 请求远程消息
+response = await getAIIMAGE(prompt);
+}
+
+// 成功后，更新记录
+await Message.update(
+{
+response: response,
+status: MESSAGE_STATUS_ANSWERED,
+},
+{
+where: {
+fromUser: FromUserName,
+request: Content,
+},
+},
+);
+
+return `[GPT]: ${response}`;
+}
+
+async function validateSignature(ctx, next) {
+const { signature, timestamp, nonce, echostr } = ctx.query;
+const token = 'YOUR_TOKEN'; // 请替换为自己的 Token
+const arr = [token, timestamp, nonce];
+arr.sort();
+const str = arr.join('');
+const sha1 = crypto.createHash('sha1');
+sha1.update(str);
+const result = sha1.digest('hex');
+if (signature === result) {
+ctx.body = echostr;
+} else {
+ctx.body = 'Invalid signature';
+}
+}
+
+async function handleMessage(ctx, next) {
+const xml = ctx.request.body;
+const message = await parser.parseStringPromise(xml);
+const {
+Content = '',
+FromUserName = '',
+ToUserName = '',
+MsgType = '',
+} = message;
+if (MsgType === 'text') {
+const result = await getAIMessage({ Content, FromUserName });
+ctx.body = builder.buildObject({
+ToUserName: FromUserName,
+FromUserName: ToUserName,
+CreateTime: +new Date(),
+  MsgType: 'text',
+  Content: result,
+});
+} else {
+ctx.body = builder.buildObject({
+ToUserName: FromUserName,
+FromUserName: ToUserName,
+CreateTime: +new Date(),
+MsgType: 'text',
+Content: '只支持文本消息',
+});
+}
+}
+
+router.get('/', validateSignature);
+router.post('/', handleMessage);
+
+const app = new Koa();
+app.use(logger()).use(bodyParser()).use(router.routes()).use(router.allowedMethods());
+
+const host = '127.0.0.1';
+const port = process.env.PORT || 80;
+async function bootstrap() {
+await initDB();
+
+app.listen(port, host, () => {
+console.log(`启动成功 http://${host}:${port}`);
+});
+}
+
+bootstrap();
+
+module.exports = {
+validateSignature,
+handleMessage,
+};
